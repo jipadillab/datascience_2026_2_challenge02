@@ -46,6 +46,7 @@ CATEGORICAL_COLS = [
     "Sistema_Riego_Tecnificado",
     "Nivel_Tecnificacion",
     "Tipo_Suelo",
+    "Departamento",
 ]
 
 DATE_COL = "Fecha_Ultima_Auditoria"
@@ -61,23 +62,41 @@ def cargar_datos(archivo, sep=",", encoding="utf-8"):
     df = pd.read_csv(archivo, sep=sep, encoding=encoding)
     df.columns = [c.strip() for c in df.columns]
 
+    # Compatibilidad de esquema: algunos CSV traen ID_Finca y Departamento
+    # por separado en lugar de una única columna ID_FincaDepartamento.
+    if ID_COL not in df.columns:
+        if "ID_Finca" in df.columns and "Departamento" in df.columns:
+            df[ID_COL] = df["ID_Finca"].astype(str) + " - " + df["Departamento"].astype(str)
+        elif "ID_Finca" in df.columns:
+            df[ID_COL] = df["ID_Finca"].astype(str)
+
     # Conversión de tipos
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if DATE_COL in df.columns:
-        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce", dayfirst=True)
+        # Intenta primero formato ISO (YYYY-MM-DD); si falla en muchas filas,
+        # reintenta con día primero (DD/MM/YYYY) como respaldo.
+        fechas_iso = pd.to_datetime(df[DATE_COL], format="%Y-%m-%d", errors="coerce")
+        if fechas_iso.isna().mean() > 0.3:
+            fechas_iso = pd.to_datetime(df[DATE_COL], errors="coerce", dayfirst=True)
+        df[DATE_COL] = fechas_iso
 
-    # Normalizar riego tecnificado a categoría legible si viene como 0/1 o bool
+    # Normalizar riego tecnificado a categoría legible (bool nativo, 0/1 o texto).
+    # Se evita Series.replace() con diccionarios de tipos mixtos porque en
+    # columnas dtype=bool puede no aplicar el reemplazo de forma consistente.
     if "Sistema_Riego_Tecnificado" in df.columns:
-        mapeo = {
-            1: "Sí", 0: "No", True: "Sí", False: "No",
-            "1": "Sí", "0": "No",
-            "si": "Sí", "Si": "Sí", "SI": "Sí", "sí": "Sí",
-            "no": "No", "No": "No", "NO": "No",
-        }
-        df["Sistema_Riego_Tecnificado"] = df["Sistema_Riego_Tecnificado"].replace(mapeo)
+        col = df["Sistema_Riego_Tecnificado"]
+        if col.dtype == bool:
+            df["Sistema_Riego_Tecnificado"] = col.map({True: "Sí", False: "No"})
+        else:
+            texto = col.astype(str).str.strip().str.lower()
+            mapeo_texto = {
+                "1": "Sí", "0": "No", "true": "Sí", "false": "No",
+                "si": "Sí", "sí": "Sí", "yes": "Sí", "no": "No",
+            }
+            df["Sistema_Riego_Tecnificado"] = texto.map(mapeo_texto).fillna(col.astype(str))
 
     return df
 
@@ -117,11 +136,21 @@ usar_demo = False
 if archivo is None:
     usar_demo = st.sidebar.checkbox("Usar datos de ejemplo (demo)", value=False)
 
-REQUIRED_COLS = [
-    ID_COL, "Tipo_Cultivo", "Area_Hectareas", "Produccion_Anual_Ton",
+REQUIRED_COLS_BASE = [
+    "Tipo_Cultivo", "Area_Hectareas", "Produccion_Anual_Ton",
     "Sistema_Riego_Tecnificado", "Nivel_Tecnificacion",
     "Precio_Venta_Por_Ton_COP", "Tipo_Suelo", DATE_COL,
 ]
+
+
+def validar_columnas(columnas_df):
+    """Devuelve la lista de columnas faltantes, aceptando ID_FincaDepartamento
+    o el esquema alterno ID_Finca (+ Departamento opcional)."""
+    faltantes = [c for c in REQUIRED_COLS_BASE if c not in columnas_df]
+    tiene_id = (ID_COL in columnas_df) or ("ID_Finca" in columnas_df)
+    if not tiene_id:
+        faltantes = [f"{ID_COL} (o ID_Finca)"] + faltantes
+    return faltantes
 
 
 def generar_datos_demo():
@@ -165,7 +194,7 @@ if archivo is None and not usar_demo:
     )
 
     with st.expander("ℹ️ Columnas que debe contener el archivo"):
-        st.code(", ".join(REQUIRED_COLS))
+        st.code(", ".join([f"{ID_COL} (o ID_Finca [+ Departamento])"] + REQUIRED_COLS_BASE))
 
     if archivo_central is not None:
         archivo = archivo_central
@@ -183,8 +212,9 @@ if archivo is not None:
         st.error(f"❌ No se pudo leer el archivo CSV. Detalle: {e}")
         st.stop()
 
-    columnas_faltantes = [c for c in REQUIRED_COLS if c not in df_raw.columns]
-    columnas_extra = [c for c in df_raw.columns if c not in REQUIRED_COLS]
+    columnas_faltantes = validar_columnas(df_raw.columns)
+    columnas_esperadas_ok = REQUIRED_COLS_BASE + [ID_COL, "ID_Finca", "Departamento"]
+    columnas_extra = [c for c in df_raw.columns if c not in columnas_esperadas_ok]
 
     st.markdown("### 🔍 Vista previa del archivo cargado")
     st.write(f"**Archivo:** `{archivo.name}` — **Filas:** {df_raw.shape[0]:,} — **Columnas:** {df_raw.shape[1]}")
@@ -220,6 +250,15 @@ df = st.session_state.df_confirmado.copy()
 # =========================================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filtros")
+
+if "Departamento" in df.columns:
+    deptos_sel = st.sidebar.multiselect(
+        "Departamento",
+        options=sorted(df["Departamento"].dropna().unique()),
+        default=None,
+    )
+    if deptos_sel:
+        df = df[df["Departamento"].isin(deptos_sel)]
 
 if "Tipo_Cultivo" in df.columns:
     cultivos_sel = st.sidebar.multiselect(
@@ -476,6 +515,16 @@ with tab_grafico:
             title="Producción Anual (Ton) por Tipo de Cultivo",
         )
         st.plotly_chart(fig_prod, use_container_width=True)
+
+    if "Produccion_Anual_Ton" in df.columns and "Departamento" in df.columns:
+        st.write("**Producción total por departamento**")
+        prod_depto = df.groupby("Departamento", as_index=False)["Produccion_Anual_Ton"].sum()
+        fig_depto = px.bar(
+            prod_depto.sort_values("Produccion_Anual_Ton", ascending=False),
+            x="Departamento", y="Produccion_Anual_Ton", color="Departamento",
+            title="Producción Anual (Ton) por Departamento",
+        )
+        st.plotly_chart(fig_depto, use_container_width=True)
 
     if "Nivel_Tecnificacion" in df.columns and "Precio_Venta_Por_Ton_COP" in df.columns:
         st.write("**Precio de venta según nivel de tecnificación**")
