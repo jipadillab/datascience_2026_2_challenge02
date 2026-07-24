@@ -56,8 +56,9 @@ ID_COL = "ID_FincaDepartamento"
 # FUNCIONES DE CARGA Y LIMPIEZA
 # =========================================================
 @st.cache_data
-def cargar_datos(archivo):
-    df = pd.read_csv(archivo)
+def cargar_datos(archivo, sep=",", encoding="utf-8"):
+    archivo.seek(0)
+    df = pd.read_csv(archivo, sep=sep, encoding=encoding)
     df.columns = [c.strip() for c in df.columns]
 
     # Conversión de tipos
@@ -99,23 +100,38 @@ def calcular_kpis(df):
 st.sidebar.title("🌾 EDA Fincas y Cultivos")
 st.sidebar.markdown("Sube tu archivo CSV para comenzar el análisis.")
 
-archivo = st.sidebar.file_uploader("Selecciona el archivo CSV", type=["csv"])
+archivo = st.sidebar.file_uploader(
+    "Selecciona el archivo CSV",
+    type=["csv"],
+    help="Arrastra tu archivo aquí o haz clic para buscarlo (máx. 200MB).",
+)
+
+sep = st.sidebar.selectbox(
+    "Separador del CSV", [",", ";", "\t", "|"], index=0,
+    format_func=lambda s: {",": "Coma (,)", ";": "Punto y coma (;)",
+                            "\t": "Tabulación", "|": "Barra vertical (|)"}[s],
+)
+encoding = st.sidebar.selectbox("Codificación", ["utf-8", "latin-1", "utf-8-sig"], index=0)
 
 usar_demo = False
 if archivo is None:
-    usar_demo = st.sidebar.checkbox("Usar datos de ejemplo (demo)", value=True)
+    usar_demo = st.sidebar.checkbox("Usar datos de ejemplo (demo)", value=False)
 
-if archivo is not None:
-    df_raw = cargar_datos(archivo)
-elif usar_demo:
+REQUIRED_COLS = [
+    ID_COL, "Tipo_Cultivo", "Area_Hectareas", "Produccion_Anual_Ton",
+    "Sistema_Riego_Tecnificado", "Nivel_Tecnificacion",
+    "Precio_Venta_Por_Ton_COP", "Tipo_Suelo", DATE_COL,
+]
+
+
+def generar_datos_demo():
     rng = np.random.default_rng(42)
     n = 300
     cultivos = ["Café", "Cacao", "Aguacate", "Plátano", "Caña de azúcar", "Maíz"]
     suelos = ["Franco", "Arcilloso", "Arenoso", "Limoso"]
     niveles = ["Bajo", "Medio", "Alto"]
     depas = ["Antioquia", "Cundinamarca", "Valle del Cauca", "Santander", "Tolima", "Huila"]
-
-    df_demo = pd.DataFrame({
+    return pd.DataFrame({
         ID_COL: [f"{rng.choice(depas)}-{i:04d}" for i in range(n)],
         "Tipo_Cultivo": rng.choice(cultivos, n),
         "Area_Hectareas": np.round(rng.gamma(4, 5, n), 2),
@@ -126,13 +142,78 @@ elif usar_demo:
         "Tipo_Suelo": rng.choice(suelos, n),
         DATE_COL: pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.integers(0, 900, n), unit="D"),
     })
-    df_raw = df_demo
-else:
-    st.title("🌾 Dashboard EDA — Fincas y Cultivos")
-    st.info("👈 Sube un archivo CSV en la barra lateral, o activa los datos de ejemplo, para comenzar.")
-    st.stop()
 
-df = df_raw.copy()
+
+# ---------------------------------------------------------
+# PANTALLA DE BIENVENIDA / CARGA (cuando aún no hay datos listos)
+# ---------------------------------------------------------
+if "df_confirmado" not in st.session_state:
+    st.session_state.df_confirmado = None
+    st.session_state.archivo_nombre = None
+
+if archivo is None and not usar_demo:
+    st.title("🌾 Dashboard EDA — Fincas y Cultivos")
+    st.markdown(
+        "Analiza tu dataset de fincas agrícolas de forma **cuantitativa, cualitativa y gráfica**."
+    )
+    st.markdown("### 📤 Carga tu archivo CSV")
+
+    archivo_central = st.file_uploader(
+        "Arrastra y suelta tu archivo aquí, o haz clic para buscarlo",
+        type=["csv"],
+        key="uploader_central",
+    )
+
+    with st.expander("ℹ️ Columnas que debe contener el archivo"):
+        st.code(", ".join(REQUIRED_COLS))
+
+    if archivo_central is not None:
+        archivo = archivo_central
+    else:
+        st.info("También puedes activar **'Usar datos de ejemplo (demo)'** en la barra lateral para explorar el dashboard sin subir un archivo.")
+        st.stop()
+
+# ---------------------------------------------------------
+# CARGA Y VALIDACIÓN DEL ARCHIVO
+# ---------------------------------------------------------
+if archivo is not None:
+    try:
+        df_raw = cargar_datos(archivo, sep=sep, encoding=encoding)
+    except Exception as e:
+        st.error(f"❌ No se pudo leer el archivo CSV. Detalle: {e}")
+        st.stop()
+
+    columnas_faltantes = [c for c in REQUIRED_COLS if c not in df_raw.columns]
+    columnas_extra = [c for c in df_raw.columns if c not in REQUIRED_COLS]
+
+    st.markdown("### 🔍 Vista previa del archivo cargado")
+    st.write(f"**Archivo:** `{archivo.name}` — **Filas:** {df_raw.shape[0]:,} — **Columnas:** {df_raw.shape[1]}")
+    st.dataframe(df_raw.head(10), use_container_width=True)
+
+    if columnas_faltantes:
+        st.error(
+            "❌ Faltan columnas requeridas para el análisis: "
+            + ", ".join(f"`{c}`" for c in columnas_faltantes)
+        )
+        st.warning("Corrige el archivo y vuelve a cargarlo para continuar.")
+        st.stop()
+    else:
+        st.success("✅ El archivo contiene todas las columnas requeridas.")
+        if columnas_extra:
+            st.info("ℹ️ Columnas adicionales detectadas (se ignorarán en el análisis): " + ", ".join(columnas_extra))
+
+    continuar = st.button("🚀 Continuar al Dashboard", type="primary")
+    if not continuar and st.session_state.archivo_nombre != archivo.name:
+        st.stop()
+
+    st.session_state.df_confirmado = df_raw
+    st.session_state.archivo_nombre = archivo.name
+
+elif usar_demo:
+    st.session_state.df_confirmado = generar_datos_demo()
+    st.session_state.archivo_nombre = "demo"
+
+df = st.session_state.df_confirmado.copy()
 
 # =========================================================
 # SIDEBAR: FILTROS
